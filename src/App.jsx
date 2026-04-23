@@ -10,6 +10,12 @@ function sv(k,v){try{localStorage.setItem(k,v)}catch{}}
 function normBase(url){url=(url||'https://api.openai.com/v1').trim().replace(/\/+$/,'');if(url.endsWith('/responses'))url=url.slice(0,-'/responses'.length);if(url.endsWith('/images/edits'))url=url.slice(0,-'/images/edits'.length);return url}
 function fileToDataUrl(f){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result);r.onerror=()=>rej(r.error);r.readAsDataURL(f)})}
 function dataUrlToBlob(d){const[h,b64]=d.split(',');const mime=h.match(/:(.*?);/)[1];const bin=atob(b64);const a=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)a[i]=bin.charCodeAt(i);return new Blob([a],{type:mime})}
+// Convert data URL → blob URL (frees JS heap, browser manages data)
+function dataUrlToBlobUrl(dataUrl){return URL.createObjectURL(dataUrlToBlob(dataUrl))}
+// Convert blob URL back to data URL (only when needed for API/export)
+async function blobUrlToDataUrl(blobUrl){const r=await fetch(blobUrl);const b=await r.blob();return new Promise((res,rej)=>{const fr=new FileReader();fr.onload=()=>res(fr.result);fr.onerror=()=>rej(fr.error);fr.readAsDataURL(b)})}
+// Convert blob URL to blob
+async function blobUrlToBlob(blobUrl){const r=await fetch(blobUrl);return r.blob()}
 function guessMime(f){return f==='jpeg'?'image/jpeg':f==='webp'?'image/webp':'image/png'}
 function guessExt(f){return f==='jpeg'?'jpg':f==='webp'?'webp':'png'}
 
@@ -28,7 +34,16 @@ function openDB(){
 }
 
 async function historyLoad(){
-  try{const db=await openDB();return new Promise(r=>{const req=db.transaction(DB_STORE,'readonly').objectStore(DB_STORE).getAll();req.onsuccess=()=>r(req.result.sort((a,b)=>b.ts-a.ts))})}catch{return[]}
+  try{
+    const db=await openDB()
+    const all=await new Promise(r=>{const req=db.transaction(DB_STORE,'readonly').objectStore(DB_STORE).getAll();req.onsuccess=()=>r(req.result)})
+    return all.sort((a,b)=>b.ts-a.ts).map(h=>{
+      // Convert blob → blob URL for display; handle legacy entries with .src
+      if(h.blob && !h.displayUrl) h.displayUrl=URL.createObjectURL(h.blob)
+      else if(h.src && !h.displayUrl) h.displayUrl=h.src // legacy: data URL
+      return h
+    })
+  }catch{return[]}
 }
 
 async function historySave(entry){
@@ -106,7 +121,20 @@ function parseSizeStr(s){if(!s||s==='auto')return null;const m=s.match(/^(\d+)x(
 // §4  APIs (Responses + Images Edit)
 // ════════════════════════════════════════════
 
-function buildInput(prompt,refs){if(!refs.length)return prompt;const c=[{type:'input_text',text:prompt}];for(const r of refs)c.push({type:'input_image',image_url:r.dataUrl});return[{role:'user',content:c}]}
+async function buildInput(prompt,refs){
+  if(!refs.length)return prompt
+  const c=[{type:'input_text',text:prompt}]
+  for(const r of refs){
+    // Read base64 on-demand: from File, blobUrl, or legacy dataUrl
+    let dataUrl
+    if(r.file) dataUrl = await fileToDataUrl(r.file)
+    else if(r.blobUrl) dataUrl = await blobUrlToDataUrl(r.blobUrl)
+    else if(r.dataUrl) dataUrl = r.dataUrl
+    else continue
+    c.push({type:'input_image',image_url:dataUrl})
+  }
+  return[{role:'user',content:c}]
+}
 function buildTool(p){const t={type:'image_generation'};if(p.size&&p.size!=='auto')t.size=p.size;if(p.quality)t.quality=p.quality;if(p.action&&p.action!=='auto')t.action=p.action;if(p.format)t.format=p.format;if(p.compression!==''&&p.compression!=null&&(p.format==='jpeg'||p.format==='webp'))t.compression=Number(p.compression);if(p.streaming)t.partial_images=3;return t}
 function extractImage(json){
   // Try standard path: output[].image_generation_call.result
@@ -133,7 +161,7 @@ function extractImage(json){
 async function*parseSSE(reader){const dec=new TextDecoder();let buf='';while(true){const{value,done}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const lines=buf.split('\n');buf=lines.pop()||'';for(const l of lines)if(l.startsWith('data: ')){const d=l.slice(6).trim();if(d==='[DONE]')return;try{yield JSON.parse(d)}catch{}}}}
 
 async function callResponses({base,key,model,prompt,refs,params,streaming,onPartial,onStatus,onDebug}){
-  const tool=buildTool({...params,streaming});const payload={model:model||'gpt-5.4',input:buildInput(prompt,refs),tools:[tool]}
+  const tool=buildTool({...params,streaming});const input=await buildInput(prompt,refs);const payload={model:model||'gpt-5.4',input,tools:[tool]}
   if(params.toolChoice)payload.tool_choice={type:'image_generation'};if(streaming)payload.stream=true
   onDebug?.({type:'request',payload:{...payload,input:'[omitted]'}})
   onStatus?.('loading',`……向 ${new URL(base).hostname} 发送……`)
@@ -219,8 +247,10 @@ async function callResponses({base,key,model,prompt,refs,params,streaming,onPart
 
 async function callImagesEdit({base,key,model,prompt,imageDataUrl,maskDataUrl,params,onStatus}){
   onStatus?.('loading','……发送编辑请求……');const form=new FormData()
-  form.append('model',model||'gpt-image-2');form.append('prompt',prompt);form.append('image',dataUrlToBlob(imageDataUrl),'image.png')
-  if(maskDataUrl)form.append('mask',dataUrlToBlob(maskDataUrl),'mask.png')
+  form.append('model',model||'gpt-image-2');form.append('prompt',prompt)
+  const imgBlob=imageDataUrl.startsWith('blob:')?await blobUrlToBlob(imageDataUrl):dataUrlToBlob(imageDataUrl)
+  form.append('image',imgBlob,'image.png')
+  if(maskDataUrl){const mBlob=maskDataUrl.startsWith('blob:')?await blobUrlToBlob(maskDataUrl):dataUrlToBlob(maskDataUrl);form.append('mask',mBlob,'mask.png')}
   if(params.size&&params.size!=='auto')form.append('size',params.size);if(params.quality)form.append('quality',params.quality)
   const resp=await fetch(`${base}/images/edits`,{method:'POST',headers:{'Authorization':`Bearer ${key}`},body:form})
   if(!resp.ok){let msg=`HTTP ${resp.status}`;try{const e=await resp.json();msg=e.error?.message||e.error||msg}catch{};throw new Error(msg)}
@@ -241,13 +271,19 @@ function taskLabel(t,idx){if(t.type==='edit')return`✎ 编辑`;const p=(t.promp
 // §6  Export / Import
 // ════════════════════════════════════════════
 
-function exportSession(tasks){
-  const data={version:2,exported:new Date().toISOString(),tasks:tasks.map(t=>({
-    prompt:t.prompt,type:t.type,overrideParams:t.overrideParams,
-    size:t.size,quality:t.quality,action:t.action,format:t.format,compression:t.compression,
-    resultSrc:t.result?.src||null,editSource:t.editSource||null,
-    references:t.references.map(r=>({dataUrl:r.dataUrl,id:r.id}))
-  }))}
+async function exportSession(tasks){
+  const exportTasks=[]
+  for(const t of tasks){
+    let resultSrc=null
+    if(t.result?.src){resultSrc=t.result.src.startsWith('blob:')?await blobUrlToDataUrl(t.result.src):t.result.src}
+    const refs=[]
+    for(const r of t.references){
+      let du=r.blobUrl&&r.file?await fileToDataUrl(r.file):r.blobUrl?await blobUrlToDataUrl(r.blobUrl):r.dataUrl||null
+      if(du)refs.push({dataUrl:du,id:r.id})
+    }
+    exportTasks.push({prompt:t.prompt,type:t.type,overrideParams:t.overrideParams,size:t.size,quality:t.quality,action:t.action,format:t.format,compression:t.compression,resultSrc,editSource:t.editSource||null,references:refs})
+  }
+  const data={version:2,exported:new Date().toISOString(),tasks:exportTasks}
   const blob=new Blob([JSON.stringify(data)],{type:'application/json'})
   const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`board-${new Date().toISOString().slice(0,10)}.json`;a.click();URL.revokeObjectURL(a.href)
 }
@@ -260,9 +296,16 @@ async function importSession(file){
     task.overrideParams=!!t.overrideParams
     task.size=t.size||'3840x2160';task.quality=t.quality||'high'
     task.action=t.action||'auto';task.format=t.format||'';task.compression=t.compression||''
-    if(t.resultSrc)task.result={status:'done',src:t.resultSrc,summary:null,error:null}
+    if(t.resultSrc){
+      // Convert imported data URL → blob URL for memory efficiency
+      const blobUrl=dataUrlToBlobUrl(t.resultSrc)
+      task.result={status:'done',src:blobUrl,summary:null,error:null}
+    }
     if(t.editSource)task.editSource=t.editSource
-    if(t.references?.length)task.references=t.references.map(r=>({dataUrl:r.dataUrl,id:r.id||crypto.randomUUID()}))
+    if(t.references?.length)task.references=t.references.map(r=>{
+      const blobUrl=r.dataUrl?dataUrlToBlobUrl(r.dataUrl):null
+      return{blobUrl,id:r.id||crypto.randomUUID()}
+    })
     return task
   })
 }
@@ -603,8 +646,8 @@ export default function App(){
 
   const getParams=useCallback(t=>t.overrideParams?{size:t.size,quality:t.quality,action:t.action,format:t.format,compression:t.compression,toolChoice:gParams.toolChoice,streaming:gParams.streaming}:gParams,[gParams])
 
-  // File handling
-  const addFiles=useCallback(async(files)=>{const nr=[];for(const f of files){if(!f.type.startsWith('image/'))continue;nr.push({file:f,dataUrl:await fileToDataUrl(f),id:crypto.randomUUID()})};updateTask(activeIdx,{references:[...task.references,...nr]})},[activeIdx,task,updateTask])
+  // File handling — store blob URL for display, File object for API
+  const addFiles=useCallback(async(files)=>{const nr=[];for(const f of files){if(!f.type.startsWith('image/'))continue;nr.push({file:f,blobUrl:URL.createObjectURL(f),id:crypto.randomUUID()})};updateTask(activeIdx,{references:[...task.references,...nr]})},[activeIdx,task,updateTask])
   const fileInputRef=useRef(null);const importInputRef=useRef(null)
   const[dragOver,setDragOver]=useState(false)
 
@@ -646,8 +689,16 @@ export default function App(){
     let ok=false
     try{
       let r;if(t.type==='edit'){r=await callImagesEdit({base,key:apiKey.trim(),model:maskModel.trim(),prompt:t.prompt.trim(),imageDataUrl:t.editSource,maskDataUrl:t.editMask,params:p,onStatus:(tp,msg)=>setStatus({type:tp,text:msg})})}
-      else{r=await callResponses({base,key:apiKey.trim(),model:model.trim(),prompt:t.prompt.trim(),refs:t.references,params:p,streaming:p.streaming,onPartial:src=>updateTaskById(tid,{partialSrc:src}),onStatus:(tp,msg)=>setStatus({type:tp,text:msg}),onDebug:addDebug})}
-      updateTaskById(tid,{result:{status:'done',src:r.src,summary:r.summary,error:null,fallback:!!r.fallback,fullRes:!!r.fullRes},partialSrc:null})
+      else{r=await callResponses({base,key:apiKey.trim(),model:model.trim(),prompt:t.prompt.trim(),refs:t.references,params:p,streaming:p.streaming,
+        onPartial:src=>{
+          // Convert partial data URL → blob URL immediately
+          const blobUrl=dataUrlToBlobUrl(src)
+          updateTaskById(tid,{partialSrc:blobUrl})
+        },
+        onStatus:(tp,msg)=>setStatus({type:tp,text:msg}),onDebug:addDebug})}
+      // Convert result data URL → blob URL (frees ~15MB JS heap per 4K image)
+      const resultBlobUrl=dataUrlToBlobUrl(r.src)
+      updateTaskById(tid,{result:{status:'done',src:resultBlobUrl,summary:r.summary,error:null,fallback:!!r.fallback,fullRes:!!r.fullRes},partialSrc:null})
       const label=t.prompt.trim().slice(0,12)
       if(r.fallback){
         if(r.fullRes){showToast(`✓ ${label}… 完成（分辨率匹配）`,tid);notify('B.O.A.R.D.','完成')}
@@ -657,9 +708,10 @@ export default function App(){
         showToast(`✓ ${label}… 完成`,tid);notify('B.O.A.R.D.','生成完成')
         setStatus({type:'success',text:t.type==='edit'?'……编辑完成。':'……完成了。'})
       }
-      const entry={id:crypto.randomUUID(),ts:Date.now(),prompt:t.prompt.trim(),src:r.src,type:t.type,
-        params:{size:p.size,quality:p.quality,action:p.action,format:p.format,compression:p.compression,toolChoice:p.toolChoice,streaming:p.streaming},
-        references:t.references.map(ref=>({dataUrl:ref.dataUrl,id:ref.id}))}
+      // Save history with blob (IDB handles Blob natively, much smaller than base64 string)
+      const resultBlob=dataUrlToBlob(r.src)
+      const entry={id:crypto.randomUUID(),ts:Date.now(),prompt:t.prompt.trim(),blob:resultBlob,type:t.type,
+        params:{size:p.size,quality:p.quality,action:p.action,format:p.format,compression:p.compression,toolChoice:p.toolChoice,streaming:p.streaming}}
       historySave(entry).then(saved=>{if(!saved)showToast('⚠ 历史保存失败——存储空间可能不足');historyLoad().then(setHistory)})
       ok=true
     }catch(err){
@@ -700,12 +752,14 @@ export default function App(){
     updateTaskById(tid,{result:{status:'loading',src:null,summary:null,error:null,fallback:false},partialSrc:null})
     try{
       const r=await callResponses({base,key:apiKey.trim(),model:model.trim(),prompt:t.prompt.trim(),refs:t.references,params:p,streaming:false,onStatus:(tp,msg)=>setStatus({type:tp,text:msg}),onDebug:addDebug})
-      updateTaskById(tid,{result:{status:'done',src:r.src,summary:r.summary,error:null,fallback:false},partialSrc:null})
+      const resultBlobUrl=dataUrlToBlobUrl(r.src)
+      updateTaskById(tid,{result:{status:'done',src:resultBlobUrl,summary:r.summary,error:null,fallback:false},partialSrc:null})
       showToast(`✓ 完成`,tid);notify('B.O.A.R.D.','生成完成')
       setStatus({type:'success',text:'……完成了。'})
-      historySave({id:crypto.randomUUID(),ts:Date.now(),prompt:t.prompt.trim(),src:r.src,type:t.type,
-        params:{size:p.size,quality:p.quality,action:p.action,format:p.format,compression:p.compression,toolChoice:p.toolChoice,streaming:false},
-        references:t.references.map(ref=>({dataUrl:ref.dataUrl,id:ref.id}))}).then(saved=>{if(!saved)showToast('⚠ 历史保存失败');historyLoad().then(setHistory)})
+      const resultBlob=dataUrlToBlob(r.src)
+      historySave({id:crypto.randomUUID(),ts:Date.now(),prompt:t.prompt.trim(),blob:resultBlob,type:t.type,
+        params:{size:p.size,quality:p.quality,action:p.action,format:p.format,compression:p.compression,toolChoice:p.toolChoice,streaming:false}
+      }).then(saved=>{if(!saved)showToast('⚠ 历史保存失败');historyLoad().then(setHistory)})
     }catch(err){
       updateTaskById(tid,{result:{status:'error',src:null,summary:null,error:err.message,fallback:false}})
       showToast(`✗ 失败: ${err.message.slice(0,30)}`,tid);setStatus({type:'error',text:err.message})
@@ -722,19 +776,20 @@ export default function App(){
     let ext='png';const m=src.match(/^data:image\/(\w+)/);if(m){ext=m[1]==='jpeg'?'jpg':m[1]}
     a.download=`${prefix}-${Date.now()}.${ext}`;a.click()
   },[])
-  const cpText=useCallback(async src=>{const b=src?.split(',')?.[1];if(b){await navigator.clipboard.writeText(b);setStatus({type:'success',text:'……base64——已复制。'})}},[])
-  const cpImage=useCallback(async src=>{try{const blob=dataUrlToBlob(src);await navigator.clipboard.write([new ClipboardItem({[blob.type]:blob})]);setStatus({type:'success',text:'……图片——已复制到剪贴板。'})}catch{setStatus({type:'error',text:'……复制失败——浏览器可能不支持。'})}},[])
+  const cpText=useCallback(async src=>{try{const du=src.startsWith('blob:')?await blobUrlToDataUrl(src):src;const b=du.split(',')?.[1];if(b){await navigator.clipboard.writeText(b);setStatus({type:'success',text:'……base64——已复制。'})}}catch{setStatus({type:'error',text:'……复制失败。'})}},[])
+  const cpImage=useCallback(async src=>{try{const blob=src.startsWith('blob:')?await blobUrlToBlob(src):dataUrlToBlob(src);await navigator.clipboard.write([new ClipboardItem({[blob.type]:blob})]);setStatus({type:'success',text:'……图片——已复制到剪贴板。'})}catch{setStatus({type:'error',text:'……复制失败——浏览器可能不支持。'})}},[])
 
   // ── Export / Import ──
-  const handleExport=useCallback(()=>exportSession(tasks),[tasks])
+  const handleExport=useCallback(async()=>{await exportSession(tasks)},[tasks])
   const handleImport=useCallback(async e=>{const f=e.target.files?.[0];if(!f)return;try{const imported=await importSession(f);if(imported.length){setTasks(imported);setActiveIdx(0);setStatus({type:'success',text:`……导入了 ${imported.length} 个任务。`})}else{setStatus({type:'error',text:'……文件里没有任务。'})}}catch(err){setStatus({type:'error',text:`……导入失败——${err.message}`})};e.target.value=''},[])
 
   // ── Load from history ──
   const loadFromHistory=useCallback(entry=>{
     const t=createTask(gParams)
     t.prompt=entry.prompt||''
-    t.result={status:'done',src:entry.src,summary:null,error:null}
-    // Restore params
+    // Use displayUrl (blob URL) or fall back to legacy src
+    const imgUrl=entry.displayUrl||entry.src
+    t.result={status:'done',src:imgUrl,summary:null,error:null}
     if(entry.params){
       t.overrideParams=true
       t.size=entry.params.size||gParams.size
@@ -742,10 +797,6 @@ export default function App(){
       t.action=entry.params.action||gParams.action
       t.format=entry.params.format||gParams.format
       t.compression=entry.params.compression??gParams.compression
-    }
-    // Restore references
-    if(entry.references?.length){
-      t.references=entry.references.map(r=>({dataUrl:r.dataUrl,id:r.id||crypto.randomUUID()}))
     }
     setTasks(prev=>{const n=[...prev,t];setActiveIdx(n.length-1);return n})
   },[gParams])
@@ -816,7 +867,7 @@ export default function App(){
             <p><span className="accent-text">点击</span>、拖拽或 <span className="accent-text">Ctrl+V 粘贴</span>——添加参考图片</p>
           </div>
           {task.references.length>0&&<div className="thumbs-row">
-            {task.references.map((ref,i)=><div key={ref.id} className="thumb-item" draggable onDragStart={e=>handleRefDragStart(e,i)} onDragOver={e=>handleRefDragOver(e,i)} onDrop={e=>handleRefDrop(e,i)}><img src={ref.dataUrl} alt="" onClick={()=>setLightboxSrc(ref.dataUrl)}/><button onClick={()=>updateTask(activeIdx,{references:task.references.filter(r=>r.id!==ref.id)})}>×</button><span className="thumb-idx">{i+1}</span></div>)}
+            {task.references.map((ref,i)=><div key={ref.id} className="thumb-item" draggable onDragStart={e=>handleRefDragStart(e,i)} onDragOver={e=>handleRefDragOver(e,i)} onDrop={e=>handleRefDrop(e,i)}><img src={ref.blobUrl||ref.dataUrl} alt="" onClick={()=>setLightboxSrc(ref.blobUrl||ref.dataUrl)}/><button onClick={()=>updateTask(activeIdx,{references:task.references.filter(r=>r.id!==ref.id)})}>×</button><span className="thumb-idx">{i+1}</span></div>)}
             <button className="btn-secondary btn-sm" onClick={()=>updateTask(activeIdx,{references:[]})}>清空</button>
           </div>}
         </>}
@@ -884,7 +935,7 @@ export default function App(){
           {historyOpen&&<>
             {history.length>0?<div className="history-grid">
               {history.map(h=><div key={h.id} className="history-item" onClick={()=>loadFromHistory(h)}>
-                <img src={h.src} alt="" loading="lazy"/>
+                <img src={h.displayUrl} alt="" loading="lazy"/>
                 <div className="history-meta">
                   <span>{h.prompt?.slice(0,25)||'无提示词'}</span>
                   <span className="mono">{h.params?.size||'auto'}{h.references?.length?` · ${h.references.length}参考`:''}</span>
