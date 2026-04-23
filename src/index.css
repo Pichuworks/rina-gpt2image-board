@@ -821,19 +821,34 @@ body {
 }
 
 .batch-conc {
-  font-size: 11px;
-  color: var(--text-muted);
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 6px;
   flex-shrink: 0;
 }
 
-.batch-conc input[type="number"] {
-  width: 38px;
-  padding: 4px 6px;
+.batch-conc span {
   font-size: 12px;
-  border-radius: 4px;
+  color: var(--text-secondary);
+}
+
+.batch-conc input[type="number"] {
+  width: 48px;
+  padding: 7px 8px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  outline: none;
+  text-align: center;
+  transition: border-color var(--transition), box-shadow var(--transition);
+}
+
+.batch-conc input[type="number"]:focus {
+  border-color: var(--border-focus);
+  box-shadow: 0 0 0 3px var(--accent-glow);
 }
 
 /* ── Toast Notifications ── */

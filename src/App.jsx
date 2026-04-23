@@ -35,11 +35,15 @@ async function historySave(entry){
   try{
     const db=await openDB();const tx=db.transaction(DB_STORE,'readwrite');const s=tx.objectStore(DB_STORE)
     s.put(entry)
-    // evict oldest
+    // evict oldest beyond MAX_HISTORY
     const all=await new Promise(r=>{const req=s.getAll();req.onsuccess=()=>r(req.result)})
     if(all.length>MAX_HISTORY){all.sort((a,b)=>a.ts-b.ts);for(let i=0;i<all.length-MAX_HISTORY;i++)s.delete(all[i].id)}
     await new Promise(r=>{tx.oncomplete=r})
-  }catch(e){console.warn('historySave:',e)}
+    return true
+  }catch(e){
+    console.warn('historySave:',e)
+    return false // caller can show warning
+  }
 }
 
 async function historyDelete(id){
@@ -103,7 +107,7 @@ function parseSizeStr(s){if(!s||s==='auto')return null;const m=s.match(/^(\d+)x(
 // ════════════════════════════════════════════
 
 function buildInput(prompt,refs){if(!refs.length)return prompt;const c=[{type:'input_text',text:prompt}];for(const r of refs)c.push({type:'input_image',image_url:r.dataUrl});return[{role:'user',content:c}]}
-function buildTool(p){const t={type:'image_generation'};if(p.size&&p.size!=='auto')t.size=p.size;if(p.quality)t.quality=p.quality;if(p.action&&p.action!=='auto')t.action=p.action;if(p.format)t.format=p.format;if(p.compression!==''&&p.compression!=null)t.compression=Number(p.compression);if(p.streaming)t.partial_images=3;return t}
+function buildTool(p){const t={type:'image_generation'};if(p.size&&p.size!=='auto')t.size=p.size;if(p.quality)t.quality=p.quality;if(p.action&&p.action!=='auto')t.action=p.action;if(p.format)t.format=p.format;if(p.compression!==''&&p.compression!=null&&(p.format==='jpeg'||p.format==='webp'))t.compression=Number(p.compression);if(p.streaming)t.partial_images=3;return t}
 function extractImage(json){
   // Try standard path: output[].image_generation_call.result
   for(const it of(json.output||[])){
@@ -138,7 +142,7 @@ async function callResponses({base,key,model,prompt,refs,params,streaming,onPart
   const mime=guessMime(params.format)
   if(streaming){
     onStatus?.('loading','……生成中……')
-    let f=null, lastPartialB64=null, partialCount=0
+    let f=null, lastPartialB64=null, lastPartialMeta=null, partialCount=0
     const sseEvents=[] // full event log
 
     // Deep-clone event, truncating any long base64 strings
@@ -163,6 +167,7 @@ async function callResponses({base,key,model,prompt,refs,params,streaming,onPart
         if(ev.type==='response.image_generation_call.partial_image'&&ev.partial_image_b64){
           partialCount++
           lastPartialB64=ev.partial_image_b64
+          lastPartialMeta={size:ev.size,quality:ev.quality}
           onPartial?.(`data:${mime};base64,${ev.partial_image_b64}`)
         }
         if(ev.type==='response.completed') f=ev.response
@@ -175,8 +180,10 @@ async function callResponses({base,key,model,prompt,refs,params,streaming,onPart
     // Always dump full event log
     onDebug?.({type:'sse_events',count:sseEvents.length,partialImages:partialCount,events:sseEvents})
 
-    // Determine if partial images were full-res (same size/quality as requested)
-    const partialFullRes = partialCount > 0
+    // Check if last partial image matches requested resolution
+    const reqSize = params.size && params.size !== 'auto' ? params.size : null
+    const partialSizeMatch = lastPartialMeta?.size && reqSize && lastPartialMeta.size === reqSize
+    const partialFullRes = partialSizeMatch
 
     // Try extracting image
     if(f){
@@ -228,7 +235,7 @@ async function runConcurrent(tasks,limit){const exec=new Set();for(const task of
 // ════════════════════════════════════════════
 
 function createTask(inherit=null){return{id:crypto.randomUUID(),prompt:'',references:[],overrideParams:false,size:inherit?.size??'3840x2160',quality:inherit?.quality??'high',action:inherit?.action??'auto',format:inherit?.format??'',compression:inherit?.compression??'',result:null,partialSrc:null,type:'generate',editSource:null,editMask:null}}
-function taskLabel(t,idx){if(t.type==='edit')return`✎ 编辑`;if(t.prompt.trim())return t.prompt.trim().slice(0,18)+(t.prompt.length>18?'…':'');return`任务 ${idx+1}`}
+function taskLabel(t,idx){if(t.type==='edit')return`✎ 编辑`;const p=(t.prompt||'').trim();if(p)return p.slice(0,18)+(p.length>18?'…':'');return`任务 ${idx+1}`}
 
 // ════════════════════════════════════════════
 // §6  Export / Import
@@ -282,7 +289,6 @@ function MaskCanvas({imageUrl,onMaskExport}){
 // ════════════════════════════════════════════
 
 function SizeSelector({value, onChange}) {
-  // Parse current value to determine tier/ratio/orientation
   const parsed = parseSizeStr(value)
   const [tier, setTier] = useState('4K')
   const [ratio, setRatio] = useState('16:9')
@@ -290,30 +296,65 @@ function SizeSelector({value, onChange}) {
   const [cw, setCw] = useState(parsed?.w ?? 3840)
   const [ch, setCh] = useState(parsed?.h ?? 2160)
 
-  // Compute resolution from tier + ratio + orientation
+  // Helper: compute and call onChange
+  const applyPreset = useCallback((t, r, land) => {
+    const tierObj = TIERS.find(x => x.id === t)
+    const ratioObj = RATIOS.find(x => x.id === r)
+    if (!tierObj || !ratioObj) return
+    const res = computeRes(tierObj.longEdge, ratioObj.w, ratioObj.h, ratioObj.w === ratioObj.h ? true : land)
+    if (res) onChange(`${res.w}x${res.h}`)
+  }, [onChange])
+
+  // Reverse-engineer from external value changes (task switch, history load)
+  const prevValueRef = useRef(value)
+  useEffect(() => {
+    if (value === prevValueRef.current) return
+    prevValueRef.current = value
+    if (value === 'auto') return
+    const p = parseSizeStr(value)
+    if (!p) return
+    setCw(p.w); setCh(p.h)
+    for (const t of TIERS) {
+      if (t.id === 'custom') continue
+      for (const r of RATIOS) {
+        for (const land of (r.w === r.h ? [true] : [true, false])) {
+          const res = computeRes(t.longEdge, r.w, r.h, land)
+          if (res && res.w === p.w && res.h === p.h) {
+            setTier(t.id); setRatio(r.id); setLandscape(land)
+            return // found — no onChange needed, value already correct
+          }
+        }
+      }
+    }
+    setTier('custom')
+  }, [value])
+
+  // Compute display resolution (read-only, never triggers onChange)
   const computedRes = useMemo(() => {
-    if (tier === 'custom') return null
-    if (value === 'auto') return null
-    const t = TIERS.find(t => t.id === tier)
-    const r = RATIOS.find(r => r.id === ratio)
+    if (tier === 'custom' || value === 'auto') return null
+    const t = TIERS.find(x => x.id === tier)
+    const r = RATIOS.find(x => x.id === ratio)
     if (!t || !r) return null
     return computeRes(t.longEdge, r.w, r.h, r.w === r.h ? true : landscape)
   }, [tier, ratio, landscape, value])
 
-  // Sync onChange when computed resolution changes
-  useEffect(() => {
-    if (value === 'auto' || tier === 'custom') return
-    if (computedRes) onChange(`${computedRes.w}x${computedRes.h}`)
-  }, [computedRes]) // eslint-disable-line
-
+  // Event handlers — these are the ONLY places that call onChange
   const handleTierChange = (newTier) => {
     setTier(newTier)
     if (newTier === 'custom') { onChange(`${cw}x${ch}`); return }
-    // Will recompute via useEffect
+    applyPreset(newTier, ratio, landscape)
   }
-
+  const handleRatioChange = (newRatio) => {
+    setRatio(newRatio)
+    if (tier !== 'custom') applyPreset(tier, newRatio, landscape)
+  }
+  const handleOrientToggle = () => {
+    const newLand = !landscape
+    setLandscape(newLand)
+    if (tier !== 'custom') applyPreset(tier, ratio, newLand)
+  }
   const handleAutoToggle = () => {
-    if (value === 'auto') { onChange(`${computedRes?.w ?? 3840}x${computedRes?.h ?? 2160}`); return }
+    if (value === 'auto') { applyPreset(tier, ratio, landscape); return }
     onChange('auto')
   }
 
@@ -324,9 +365,6 @@ function SizeSelector({value, onChange}) {
   }, [value])
 
   const isAuto = value === 'auto'
-  const displayW = parsed?.w ?? computedRes?.w ?? '—'
-  const displayH = parsed?.h ?? computedRes?.h ?? '—'
-  const totalPx = parsed ? parsed.w * parsed.h : 0
   const ratioObj = RATIOS.find(r => r.id === ratio)
   const isSquare = ratioObj?.w === ratioObj?.h
 
@@ -347,11 +385,11 @@ function SizeSelector({value, onChange}) {
           </select>
           {tier !== 'custom' && <>
             <span className="mono size-x">×</span>
-            <select value={ratio} onChange={e => setRatio(e.target.value)} className="size-ratio">
+            <select value={ratio} onChange={e => handleRatioChange(e.target.value)} className="size-ratio">
               {RATIOS.map(r => <option key={r.id} value={r.id}>{r.id}</option>)}
             </select>
             {!isSquare && (
-              <button className="size-orient" onClick={() => setLandscape(!landscape)}>
+              <button className="size-orient" onClick={handleOrientToggle}>
                 {landscape ? '横' : '竖'}
               </button>
             )}
@@ -516,8 +554,11 @@ export default function App(){
   const[concurrency,setConcurrency]=useState(3)
   const[tasks,setTasks]=useState(()=>[createTask()])
   const[activeIdx,setActiveIdx]=useState(0)
+  // Clamp activeIdx when tasks array shrinks
+  useEffect(()=>{if(activeIdx>=tasks.length)setActiveIdx(Math.max(0,tasks.length-1))},[tasks.length,activeIdx])
   const[status,setStatus]=useState({type:'idle',text:''})
   const[generatingIds,setGeneratingIds]=useState(new Set())
+  const inflightRef=useRef(new Set()) // sync lock for #3
 
   // History
   const[history,setHistory]=useState([])
@@ -526,8 +567,8 @@ export default function App(){
 
   // Toasts
   const[toasts,setToasts]=useState([])
-  const showToast=useCallback((text,taskIdx=null)=>{
-    const id=crypto.randomUUID();setToasts(prev=>[...prev,{id,text,taskIdx}])
+  const showToast=useCallback((text,taskId=null)=>{
+    const id=crypto.randomUUID();setToasts(prev=>[...prev,{id,text,taskId}])
     setTimeout(()=>setToasts(prev=>prev.filter(t=>t.id!==id)),4000)
   },[])
 
@@ -546,13 +587,15 @@ export default function App(){
 
   // Notify (browser notification when tab is hidden)
   const notify=useCallback((title,body)=>{
-    if(document.hidden&&'Notification' in window&&Notification.permission==='granted'){
-      try{new Notification(title,{body,icon:'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><text y="24" font-size="24">🎨</text></svg>'})}catch{}
-    }
+    try{if(document.hidden&&'Notification' in window&&Notification.permission==='granted')new Notification(title,{body})}catch{}
   },[])
 
-  const task=tasks[activeIdx]||tasks[0]
+  const task=tasks[activeIdx]||tasks[0]||createTask()
+  // Ensure task always has required fields (defensive against corrupted state)
+  if(!task.references)task.references=[]
   const updateTask=useCallback((idx,patch)=>{setTasks(prev=>{const n=[...prev];n[idx]={...n[idx],...patch};return n})},[])
+  const updateTaskById=useCallback((id,patch)=>{setTasks(prev=>prev.map(t=>t.id===id?{...t,...patch}:t))},[])
+  const findTaskIdx=useCallback((id)=>tasks.findIndex(t=>t.id===id),[tasks])
 
   // ── Tab management ──
   const addTask=useCallback(()=>{const t=createTask(gParams);setTasks(prev=>{const n=[...prev,t];setActiveIdx(n.length-1);return n})},[gParams])
@@ -591,80 +634,94 @@ export default function App(){
 
   // ── Generate ──
   const generateOne=useCallback(async(idx)=>{
-    const t=tasks[idx];if(!t.prompt.trim()){setStatus({type:'error',text:'……提示词——不能是空的。'});return}
-    if(!apiKey.trim()){setStatus({type:'error',text:'……API Key——需要填写。'});if(!settingsOpen)setSettingsOpen(true);return}
-    if(generatingIds.has(t.id))return
-    const p=getParams(t);const parsed=parseSizeStr(p.size);if(parsed&&!validateSize(parsed.w,parsed.h).valid){setStatus({type:'error',text:'……分辨率——不符合要求。'});return}
-    const base=normBase(baseUrl);setGeneratingIds(prev=>new Set(prev).add(t.id))
-    setDebugLog([]) // clear debug for this run
-    updateTask(idx,{result:{status:'loading',src:null,summary:null,error:null},partialSrc:null})
+    const t=tasks[idx];if(!t||!t.prompt.trim()){setStatus({type:'error',text:'……提示词——不能是空的。'});return false}
+    if(!apiKey.trim()){setStatus({type:'error',text:'……API Key——需要填写。'});if(!settingsOpen)setSettingsOpen(true);return false}
+    if(inflightRef.current.has(t.id))return false
+    inflightRef.current.add(t.id)
+    const tid=t.id // capture stable ID
+    const p=getParams(t);const parsed=parseSizeStr(p.size);if(parsed&&!validateSize(parsed.w,parsed.h).valid){setStatus({type:'error',text:'……分辨率——不符合要求。'});inflightRef.current.delete(tid);return false}
+    const base=normBase(baseUrl);setGeneratingIds(prev=>new Set(prev).add(tid))
+    setDebugLog([])
+    updateTaskById(tid,{result:{status:'loading',src:null,summary:null,error:null},partialSrc:null})
+    let ok=false
     try{
       let r;if(t.type==='edit'){r=await callImagesEdit({base,key:apiKey.trim(),model:maskModel.trim(),prompt:t.prompt.trim(),imageDataUrl:t.editSource,maskDataUrl:t.editMask,params:p,onStatus:(tp,msg)=>setStatus({type:tp,text:msg})})}
-      else{r=await callResponses({base,key:apiKey.trim(),model:model.trim(),prompt:t.prompt.trim(),refs:t.references,params:p,streaming:p.streaming,onPartial:src=>updateTask(idx,{partialSrc:src}),onStatus:(tp,msg)=>setStatus({type:tp,text:msg}),onDebug:addDebug})}
-      updateTask(idx,{result:{status:'done',src:r.src,summary:r.summary,error:null,fallback:!!r.fallback,fullRes:!!r.fullRes},partialSrc:null})
+      else{r=await callResponses({base,key:apiKey.trim(),model:model.trim(),prompt:t.prompt.trim(),refs:t.references,params:p,streaming:p.streaming,onPartial:src=>updateTaskById(tid,{partialSrc:src}),onStatus:(tp,msg)=>setStatus({type:tp,text:msg}),onDebug:addDebug})}
+      updateTaskById(tid,{result:{status:'done',src:r.src,summary:r.summary,error:null,fallback:!!r.fallback,fullRes:!!r.fullRes},partialSrc:null})
+      const label=t.prompt.trim().slice(0,12)
       if(r.fallback){
-        if(r.fullRes){
-          showToast(`✓ 任务 ${idx+1} 完成（连接提前断开，图像为全尺寸）`,idx)
-          notify('B.O.A.R.D.',`任务 ${idx+1} 完成（全尺寸）`)
-          if(idx===activeIdx)setStatus({type:'success',text:'……完成了。连接提前断开——但图像是全尺寸全质量的。'})
-        }else{
-          showToast(`⚠ 任务 ${idx+1} 连接中断——已使用预览图`,idx)
-          notify('B.O.A.R.D.',`任务 ${idx+1} 连接中断`)
-          if(idx===activeIdx)setStatus({type:'success',text:'……连接中断——已使用预览图。可以关闭流式传输重试。'})
-        }
+        if(r.fullRes){showToast(`✓ ${label}… 完成（分辨率匹配）`,tid);notify('B.O.A.R.D.','完成')}
+        else{showToast(`⚠ ${label}… 连接中断——已使用预览图`,tid);notify('B.O.A.R.D.','连接中断')}
+        setStatus({type:'success',text:r.fullRes?'……完成了。连接中断——partial image 分辨率匹配。':'……连接中断——已使用预览图。'})
       }else{
-        showToast(`✓ 任务 ${idx+1} 完成`,idx)
-        notify('B.O.A.R.D.',`任务 ${idx+1} 生成完成`)
-        if(idx===activeIdx)setStatus({type:'success',text:t.type==='edit'?'……编辑完成。':'……完成了。'})
+        showToast(`✓ ${label}… 完成`,tid);notify('B.O.A.R.D.','生成完成')
+        setStatus({type:'success',text:t.type==='edit'?'……编辑完成。':'……完成了。'})
       }
       const entry={id:crypto.randomUUID(),ts:Date.now(),prompt:t.prompt.trim(),src:r.src,type:t.type,
         params:{size:p.size,quality:p.quality,action:p.action,format:p.format,compression:p.compression,toolChoice:p.toolChoice,streaming:p.streaming},
         references:t.references.map(ref=>({dataUrl:ref.dataUrl,id:ref.id}))}
-      historySave(entry).then(()=>historyLoad().then(setHistory))
+      historySave(entry).then(saved=>{if(!saved)showToast('⚠ 历史保存失败——存储空间可能不足');historyLoad().then(setHistory)})
+      ok=true
     }catch(err){
-      updateTask(idx,{result:{status:'error',src:null,summary:null,error:err.message}})
-      showToast(`✗ 任务 ${idx+1} 失败`,idx)
-      notify('B.O.A.R.D.',`任务 ${idx+1} 失败: ${err.message.slice(0,50)}`)
-      if(idx===activeIdx)setStatus({type:'error',text:err.message})
+      updateTaskById(tid,{result:{status:'error',src:null,summary:null,error:err.message}})
+      showToast(`✗ 失败: ${err.message.slice(0,30)}`,tid)
+      notify('B.O.A.R.D.',`失败: ${err.message.slice(0,50)}`)
+      setStatus({type:'error',text:err.message})
     }
-    finally{setGeneratingIds(prev=>{const n=new Set(prev);n.delete(t.id);return n})}
-  },[tasks,apiKey,baseUrl,model,maskModel,getParams,updateTask,settingsOpen,generatingIds,activeIdx,showToast,addDebug,notify])
+    finally{inflightRef.current.delete(tid);setGeneratingIds(prev=>{const n=new Set(prev);n.delete(tid);return n})}
+    return ok
+  },[tasks,apiKey,baseUrl,model,maskModel,getParams,updateTaskById,settingsOpen,showToast,addDebug,notify])
 
   const generateAll=useCallback(async()=>{
     if(!apiKey.trim()){setStatus({type:'error',text:'……API Key——需要填写。'});return}
-    const vt=tasks.map((t,i)=>[t,i]).filter(([t])=>t.prompt.trim()&&!generatingIds.has(t.id));if(!vt.length){setStatus({type:'error',text:'……没有可以生成的任务。'});return}
-    setStatus({type:'loading',text:`……${vt.length} 个任务——并发 ${concurrency}……`})
-    await runConcurrent(vt.map(([,i])=>()=>generateOne(i)),concurrency)
-    setStatus({type:'success',text:`……${vt.length} 个任务——完成。`})
+    const vt=tasks.map((t,i)=>[t,i]).filter(([t])=>t.prompt.trim()&&!inflightRef.current.has(t.id))
+    if(!vt.length){
+      const empty=tasks.filter(t=>!t.prompt.trim()).length
+      setStatus({type:'error',text:empty?`……${empty} 个任务没有提示词。`:'……没有可以生成的任务。'});return
+    }
+    const skipped=tasks.length-vt.length
+    setStatus({type:'loading',text:`……${vt.length} 个任务——并发 ${concurrency}${skipped?`（跳过 ${skipped} 个）`:''}……`})
+    const results=await Promise.allSettled(vt.map(([,i])=>generateOne(i)))
+    const ok=results.filter(r=>r.status==='fulfilled'&&r.value===true).length
+    const fail=vt.length-ok
+    if(fail===0)setStatus({type:'success',text:`……${ok} 个任务——全部完成。`})
+    else setStatus({type:'error',text:`……完成 ${ok} / 失败 ${fail}。`})
   },[tasks,apiKey,concurrency,generateOne])
 
   // ── Retry without streaming ──
   const retryNoStream=useCallback(async(idx)=>{
-    const t=tasks[idx];if(!t.prompt.trim()||!apiKey.trim())return
-    if(generatingIds.has(t.id))return
+    const t=tasks[idx];if(!t||!t.prompt.trim()||!apiKey.trim())return
+    if(inflightRef.current.has(t.id))return
+    inflightRef.current.add(t.id)
+    const tid=t.id
     const p={...getParams(t),streaming:false,toolChoice:gParams.toolChoice}
-    const base=normBase(baseUrl);setGeneratingIds(prev=>new Set(prev).add(t.id))
+    const base=normBase(baseUrl);setGeneratingIds(prev=>new Set(prev).add(tid))
     setDebugLog([])
-    updateTask(idx,{result:{status:'loading',src:null,summary:null,error:null,fallback:false},partialSrc:null})
+    updateTaskById(tid,{result:{status:'loading',src:null,summary:null,error:null,fallback:false},partialSrc:null})
     try{
       const r=await callResponses({base,key:apiKey.trim(),model:model.trim(),prompt:t.prompt.trim(),refs:t.references,params:p,streaming:false,onStatus:(tp,msg)=>setStatus({type:tp,text:msg}),onDebug:addDebug})
-      updateTask(idx,{result:{status:'done',src:r.src,summary:r.summary,error:null,fallback:false},partialSrc:null})
-      showToast(`✓ 任务 ${idx+1} 完成`,idx);notify('B.O.A.R.D.',`任务 ${idx+1} 生成完成`)
-      if(idx===activeIdx)setStatus({type:'success',text:'……完成了。'})
+      updateTaskById(tid,{result:{status:'done',src:r.src,summary:r.summary,error:null,fallback:false},partialSrc:null})
+      showToast(`✓ 完成`,tid);notify('B.O.A.R.D.','生成完成')
+      setStatus({type:'success',text:'……完成了。'})
       historySave({id:crypto.randomUUID(),ts:Date.now(),prompt:t.prompt.trim(),src:r.src,type:t.type,
         params:{size:p.size,quality:p.quality,action:p.action,format:p.format,compression:p.compression,toolChoice:p.toolChoice,streaming:false},
-        references:t.references.map(ref=>({dataUrl:ref.dataUrl,id:ref.id}))}).then(()=>historyLoad().then(setHistory))
+        references:t.references.map(ref=>({dataUrl:ref.dataUrl,id:ref.id}))}).then(saved=>{if(!saved)showToast('⚠ 历史保存失败');historyLoad().then(setHistory)})
     }catch(err){
-      updateTask(idx,{result:{status:'error',src:null,summary:null,error:err.message,fallback:false}})
-      showToast(`✗ 任务 ${idx+1} 失败`,idx);if(idx===activeIdx)setStatus({type:'error',text:err.message})
-    }finally{setGeneratingIds(prev=>{const n=new Set(prev);n.delete(t.id);return n})}
-  },[tasks,apiKey,baseUrl,model,getParams,gParams,updateTask,generatingIds,activeIdx,showToast,addDebug,notify])
+      updateTaskById(tid,{result:{status:'error',src:null,summary:null,error:err.message,fallback:false}})
+      showToast(`✗ 失败: ${err.message.slice(0,30)}`,tid);setStatus({type:'error',text:err.message})
+    }finally{inflightRef.current.delete(tid);setGeneratingIds(prev=>{const n=new Set(prev);n.delete(tid);return n})}
+  },[tasks,apiKey,baseUrl,model,getParams,gParams,updateTaskById,showToast,addDebug,notify])
 
   // ── Mask edit ──
   const startMaskEdit=useCallback(srcDataUrl=>{const t=createTask();t.type='edit';t.editSource=srcDataUrl;setTasks(prev=>{const n=[...prev,t];setActiveIdx(n.length-1);return n})},[])
 
   // ── Copy / Download ──
-  const dl=useCallback((src,prefix='board')=>{const a=document.createElement('a');a.href=src;a.download=`${prefix}-${Date.now()}.${guessExt(gParams.format)}`;a.click()},[gParams.format])
+  const dl=useCallback((src,prefix='board')=>{
+    const a=document.createElement('a');a.href=src
+    // Fix #6: infer extension from actual MIME, not global params
+    let ext='png';const m=src.match(/^data:image\/(\w+)/);if(m){ext=m[1]==='jpeg'?'jpg':m[1]}
+    a.download=`${prefix}-${Date.now()}.${ext}`;a.click()
+  },[])
   const cpText=useCallback(async src=>{const b=src?.split(',')?.[1];if(b){await navigator.clipboard.writeText(b);setStatus({type:'success',text:'……base64——已复制。'})}},[])
   const cpImage=useCallback(async src=>{try{const blob=dataUrlToBlob(src);await navigator.clipboard.write([new ClipboardItem({[blob.type]:blob})]);setStatus({type:'success',text:'……图片——已复制到剪贴板。'})}catch{setStatus({type:'error',text:'……复制失败——浏览器可能不支持。'})}},[])
 
@@ -767,10 +824,19 @@ export default function App(){
         <button className="btn-primary" onClick={()=>generateOne(activeIdx)} disabled={taskIsGenerating}>
           {taskIsGenerating?<><div className="spinner"/>……{task.type==='edit'?'编辑中':'生成中'}</>:task.type==='edit'?'应用编辑':'生成'}
         </button>
-        {tasks.length>1&&<div className="batch-bar">
-          <button className="btn-secondary" onClick={generateAll} disabled={isGenerating} style={{flex:1}}>▸ 全部生成 ({tasks.filter(t=>t.prompt.trim()&&!generatingIds.has(t.id)).length})</button>
-          <label className="mono batch-conc">并发 <input type="number" min="1" max="5" value={concurrency} onChange={e=>setConcurrency(Math.max(1,Math.min(5,+e.target.value)))}/></label>
-        </div>}
+        {tasks.length>1&&(()=>{
+          const ready=tasks.filter(t=>t.prompt.trim()&&!inflightRef.current.has(t.id)).length
+          const total=tasks.length
+          return <div className="batch-bar">
+            <button className="btn-secondary" onClick={generateAll} disabled={isGenerating||ready===0} style={{flex:1}}>
+              ▸ 全部生成 ({ready === total ? ready : `${ready}/${total}`})
+            </button>
+            <div className="batch-conc">
+              <span className="mono">并发</span>
+              <input type="number" min="1" max="5" value={concurrency} onChange={e=>setConcurrency(Math.max(1,Math.min(5,+e.target.value)))}/>
+            </div>
+          </div>
+        })()}
       </div>
 
       {/* ── Right ── */}
@@ -839,9 +905,9 @@ export default function App(){
     {/* ── Toasts ── */}
     {toasts.length>0&&<div className="toast-container">
       {toasts.map(t=><div key={t.id} className={`toast ${t.text.startsWith('✗')?'toast-error':''}`}
-        onClick={()=>{if(t.taskIdx!=null)setActiveIdx(t.taskIdx);setToasts(prev=>prev.filter(x=>x.id!==t.id))}}>
+        onClick={()=>{if(t.taskId!=null){const i=tasks.findIndex(x=>x.id===t.taskId);if(i>=0)setActiveIdx(i)};setToasts(prev=>prev.filter(x=>x.id!==t.id))}}>
         {t.text}
-        {t.taskIdx!=null&&<span className="toast-jump">点击查看</span>}
+        {t.taskId!=null&&<span className="toast-jump">点击查看</span>}
       </div>)}
     </div>}
   </div>)
