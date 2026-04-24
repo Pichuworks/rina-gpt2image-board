@@ -773,6 +773,7 @@ body {
 .tab:hover { color: var(--text); border-color: var(--accent-dim); }
 .tab.active { color: var(--accent); border-color: var(--accent); background: var(--accent-glow); }
 .tab.generating { animation: tabPulse 1.5s ease infinite; }
+.tab.retrying .tab-label::before { content: '↻ '; color: var(--accent); font-size: 10px; }
 .tab.done .tab-label::before { content: '● '; color: var(--success); font-size: 8px; }
 .tab.error .tab-label::before { content: '● '; color: var(--danger); font-size: 8px; }
 
@@ -1113,6 +1114,39 @@ body {
   background: rgba(106, 174, 140, 0.08);
   border-color: rgba(106, 174, 140, 0.25);
   color: #4a7a5c;
+}
+
+/* ── Retry Bar ── */
+
+.retry-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 10px 14px;
+  background: var(--bg-deep);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.retry-active {
+  border-color: var(--accent-dim);
+  background: var(--accent-glow);
+}
+
+.retry-progress {
+  flex: 1;
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.retry-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 300ms ease;
 }
 
 /* ── Edit Section ── */

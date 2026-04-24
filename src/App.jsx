@@ -153,9 +153,13 @@ function extractImage(json){
   }
   // Try: data[].b64_json (Images API style response)
   if(json.data?.[0]?.b64_json)return{b64:json.data[0].b64_json,summary:{revised_prompt:json.data[0].revised_prompt,usage:json.usage}}
-  // Fail with debug info
-  const types=(json.output||[]).map(o=>o?.type).join(',')
-  throw new Error(`……没有找到图像数据。output types: [${types}]`)
+  // Fail with useful info
+  const outputCount=(json.output||[]).length
+  const types=(json.output||[]).map(o=>`${o?.type}(${o?.status||'?'})`).join(',')
+  const status=json.status||'unknown'
+  const err=json.error?JSON.stringify(json.error):''
+  const incomplete=json.incomplete_details?JSON.stringify(json.incomplete_details):''
+  throw new Error(`……没有找到图像数据。status=${status}, outputs=${outputCount}[${types}]${err?' error='+err:''}${incomplete?' incomplete='+incomplete:''}`)
 }
 
 async function*parseSSE(reader){const dec=new TextDecoder();let buf='';while(true){const{value,done}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const lines=buf.split('\n');buf=lines.pop()||'';for(const l of lines)if(l.startsWith('data: ')){const d=l.slice(6).trim();if(d==='[DONE]')return;try{yield JSON.parse(d)}catch{}}}}
@@ -240,7 +244,9 @@ async function callResponses({base,key,model,prompt,refs,params,streaming,onPart
     throw new Error('……stream——没有completed事件，也没有partial image。')
   }else{
     onStatus?.('loading','……等待结果……');const data=await resp.json()
-    onDebug?.({type:'non_stream_response',id:data.id,outputTypes:(data.output||[]).map(o=>({type:o?.type,hasResult:!!o?.result}))})
+    // Log full response structure (truncate base64 blobs)
+    const safeData={...data,output:(data.output||[]).map(o=>{const c={...o};if(typeof c.result==='string'&&c.result.length>200)c.result=`[base64 ${c.result.length} chars]`;return c})}
+    onDebug?.({type:'non_stream_response',id:data.id,status:data.status,error:data.error,incomplete_details:data.incomplete_details,outputCount:(data.output||[]).length,outputTypes:(data.output||[]).map(o=>({type:o?.type,status:o?.status,hasResult:!!o?.result})),fullResponse:safeData})
     const{b64,summary}=extractImage(data);return{src:`data:${mime};base64,${b64}`,summary}
   }
 }
@@ -264,7 +270,7 @@ async function runConcurrent(tasks,limit){const exec=new Set();for(const task of
 // §5  Task Factory
 // ════════════════════════════════════════════
 
-function createTask(inherit=null){return{id:crypto.randomUUID(),prompt:'',references:[],overrideParams:false,size:inherit?.size??'3840x2160',quality:inherit?.quality??'high',action:inherit?.action??'auto',format:inherit?.format??'',compression:inherit?.compression??'',result:null,partialSrc:null,type:'generate',editSource:null,editMask:null}}
+function createTask(inherit=null){return{id:crypto.randomUUID(),prompt:'',references:[],overrideParams:false,size:inherit?.size??'3840x2160',quality:inherit?.quality??'high',action:inherit?.action??'auto',format:inherit?.format??'',compression:inherit?.compression??'',result:null,partialSrc:null,type:'generate',editSource:null,editMask:null,retry:null}}
 function taskLabel(t,idx){if(t.type==='edit')return`✎ 编辑`;const p=(t.prompt||'').trim();if(p)return p.slice(0,18)+(p.length>18?'…':'');return`任务 ${idx+1}`}
 
 // ════════════════════════════════════════════
@@ -681,8 +687,13 @@ export default function App(){
     if(!apiKey.trim()){setStatus({type:'error',text:'……API Key——需要填写。'});if(!settingsOpen)setSettingsOpen(true);return false}
     if(inflightRef.current.has(t.id))return false
     inflightRef.current.add(t.id)
-    const tid=t.id // capture stable ID
-    const p=getParams(t);const parsed=parseSizeStr(p.size);if(parsed&&!validateSize(parsed.w,parsed.h).valid){setStatus({type:'error',text:'……分辨率——不符合要求。'});inflightRef.current.delete(tid);return false}
+    const tid=t.id
+    // Snapshot params into task at generation time (Fix #1)
+    const p=getParams(t)
+    if(!t.overrideParams){
+      updateTaskById(tid,{overrideParams:true,size:p.size,quality:p.quality,action:p.action,format:p.format,compression:p.compression})
+    }
+    const parsed=parseSizeStr(p.size);if(parsed&&!validateSize(parsed.w,parsed.h).valid){setStatus({type:'error',text:'……分辨率——不符合要求。'});inflightRef.current.delete(tid);return false}
     const base=normBase(baseUrl);setGeneratingIds(prev=>new Set(prev).add(tid))
     setDebugLog([])
     updateTaskById(tid,{result:{status:'loading',src:null,summary:null,error:null},partialSrc:null})
@@ -766,6 +777,31 @@ export default function App(){
     }finally{inflightRef.current.delete(tid);setGeneratingIds(prev=>{const n=new Set(prev);n.delete(tid);return n})}
   },[tasks,apiKey,baseUrl,model,getParams,gParams,updateTaskById,showToast,addDebug,notify])
 
+  // ── Auto-retry (per-task) ──
+  const cancelRetryRef=useRef(new Set()) // set of task IDs to cancel
+
+  const retryUntilSuccess=useCallback(async(idx,maxAttempts=100)=>{
+    const tid=tasks[idx]?.id;if(!tid)return
+    cancelRetryRef.current.delete(tid)
+    updateTaskById(tid,{retry:{attempt:0,max:maxAttempts,active:true}})
+    for(let attempt=1;attempt<=maxAttempts;attempt++){
+      if(cancelRetryRef.current.has(tid)){
+        updateTaskById(tid,{retry:null})
+        setStatus({type:'idle',text:`……重试已取消（第 ${attempt-1} 次）。`})
+        return
+      }
+      updateTaskById(tid,{retry:{attempt,max:maxAttempts,active:true}})
+      const ok=await generateOne(idx)
+      if(ok){updateTaskById(tid,{retry:null});return}
+      // Fixed 3s delay
+      await new Promise(r=>setTimeout(r,3000))
+    }
+    updateTaskById(tid,{retry:null})
+    setStatus({type:'error',text:`……${maxAttempts} 次尝试均失败。`})
+  },[tasks,generateOne,updateTaskById])
+
+  const cancelRetry=useCallback((tid)=>{cancelRetryRef.current.add(tid)},[])
+
   // ── Mask edit ──
   const startMaskEdit=useCallback(srcDataUrl=>{const t=createTask();t.type='edit';t.editSource=srcDataUrl;setTasks(prev=>{const n=[...prev,t];setActiveIdx(n.length-1);return n})},[])
 
@@ -836,9 +872,9 @@ export default function App(){
     <div className="tab-bar">
       <div className="tab-scroll">
         {tasks.map((t,i)=>(
-          <button key={t.id} className={`tab ${i===activeIdx?'active':''} ${generatingIds.has(t.id)?'generating':''} ${t.result?.status==='done'?'done':''} ${t.result?.status==='error'?'error':''}`}
+          <button key={t.id} className={`tab ${i===activeIdx?'active':''} ${generatingIds.has(t.id)?'generating':''} ${t.result?.status==='done'?'done':''} ${t.result?.status==='error'?'error':''} ${t.retry?.active?'retrying':''}`}
             onClick={()=>setActiveIdx(i)}>
-            <span className="tab-label">{taskLabel(t,i)}</span>
+            <span className="tab-label">{taskLabel(t,i)}{t.retry?.active?` ↻${t.retry.attempt}`:''}</span>
             {tasks.length>1&&<span className="tab-close" onClick={e=>{e.stopPropagation();removeTask(i)}}>×</span>}
           </button>
         ))}
@@ -913,6 +949,18 @@ export default function App(){
             :'⚠ 流式传输中断——当前显示的是预览图，可能不是最终质量。'
           }</span>
           <button className="btn-secondary btn-sm" onClick={()=>retryNoStream(activeIdx)} disabled={taskIsGenerating}>关闭流式重试</button>
+        </div>}
+
+        {/* Retry controls */}
+        {task.result?.status==='error'&&!taskIsGenerating&&!task.retry?.active&&<div className="retry-bar">
+          <button className="btn-secondary" onClick={()=>generateOne(activeIdx)}>重试一次</button>
+          <button className="btn-secondary" onClick={()=>retryUntilSuccess(activeIdx,100)}>自动重试（最多100次）</button>
+        </div>}
+
+        {task.retry?.active&&<div className="retry-bar retry-active">
+          <span className="mono">第 {task.retry.attempt}/{task.retry.max} 次</span>
+          <div className="retry-progress"><div className="retry-fill" style={{width:`${(task.retry.attempt/task.retry.max)*100}%`}}/></div>
+          <button className="btn-secondary btn-sm" onClick={()=>cancelRetry(task.id)}>取消</button>
         </div>}
 
         {status.text&&<div className={`status-bar ${status.type==='error'?'error':''} ${status.type==='success'?'success':''}`}><span className={`status-dot ${status.type}`}/>{status.text}</div>}
