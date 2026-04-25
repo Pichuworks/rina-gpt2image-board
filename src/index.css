@@ -45,6 +45,145 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* ── Global Scrollbar ── */
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+*::-webkit-scrollbar { width: 6px; height: 6px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+*::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* ── Global Input / Select / Textarea ── */
+
+input, select, textarea {
+  font-family: var(--font-body);
+  font-size: 14px;
+  color: var(--text);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  outline: none;
+  transition: border-color var(--transition), box-shadow var(--transition);
+}
+
+input:not([type="checkbox"]):not([type="range"]):focus, select:focus, textarea:focus {
+  border-color: var(--border-focus);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+select {
+  cursor: pointer;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%236B7394' stroke-width='1.2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  padding-right: 24px;
+}
+
+input[type="number"] {
+  font-family: var(--font-mono);
+  text-align: center;
+}
+
+/* Hide number spinners */
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type="number"] { -moz-appearance: textfield; }
+
+/* ── Custom Checkbox ── */
+
+input[type="checkbox"] {
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border: 1.5px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-input);
+  cursor: pointer;
+  position: relative;
+  flex-shrink: 0;
+  transition: all var(--transition);
+  padding: 0;
+}
+
+input[type="checkbox"]:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+input[type="checkbox"]:checked::after {
+  content: '';
+  position: absolute;
+  left: 4.5px;
+  top: 1.5px;
+  width: 5px;
+  height: 9px;
+  border: solid white;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+
+input[type="checkbox"]:focus-visible {
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+/* ── Custom Range Slider ── */
+
+input[type="range"] {
+  appearance: none;
+  height: 4px;
+  background: var(--border);
+  border: none;
+  border-radius: 2px;
+  cursor: pointer;
+  padding: 0;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--bg-input);
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+  transition: transform var(--transition);
+}
+
+input[type="range"]::-webkit-slider-thumb:hover {
+  transform: scale(1.15);
+}
+
+input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--bg-input);
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+}
+
+input[type="range"]:focus-visible {
+  outline: none;
+}
+
+input[type="range"]:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
 /* ── Layout ── */
 
 .app-shell {
@@ -200,23 +339,8 @@ body {
 .field input,
 .field select,
 .field textarea {
-  font-family: var(--font-body);
-  font-size: 14px;
-  color: var(--text);
-  background: var(--bg-input);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 9px 12px;
-  outline: none;
-  transition: border-color var(--transition), box-shadow var(--transition);
   width: 100%;
-}
-
-.field input:focus,
-.field select:focus,
-.field textarea:focus {
-  border-color: var(--border-focus);
-  box-shadow: 0 0 0 3px var(--accent-glow);
+  padding: 9px 12px;
 }
 
 .field input[type="password"] {
@@ -232,11 +356,6 @@ body {
 }
 
 .field select {
-  cursor: pointer;
-  appearance: none;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%236B7394' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 12px center;
   padding-right: 32px;
 }
 
@@ -244,16 +363,9 @@ body {
 
 .params-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 10px;
-  margin-top: 14px;
-}
-
-.params-grid-2 {
-  display: grid;
   grid-template-columns: repeat(2, 1fr);
   gap: 10px;
-  margin-top: 10px;
+  margin-top: 14px;
 }
 
 /* ── Checkbox ── */
@@ -263,13 +375,6 @@ body {
   align-items: center;
   gap: 8px;
   margin-top: 14px;
-  cursor: pointer;
-}
-
-.checkbox-field input[type="checkbox"] {
-  width: 16px;
-  height: 16px;
-  accent-color: var(--accent);
   cursor: pointer;
 }
 
@@ -653,20 +758,8 @@ body {
 }
 
 .size-tier, .size-ratio {
-  font-family: var(--font-body);
   font-size: 13px;
-  color: var(--text);
-  background: var(--bg-input);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
   padding: 7px 10px;
-  outline: none;
-  cursor: pointer;
-  appearance: none;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%236B7394' stroke-width='1.2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 8px center;
-  padding-right: 24px;
 }
 
 .size-tier { width: 80px; }
@@ -714,22 +807,7 @@ body {
 
 .exp-tag { display:inline-block;margin-left:6px;padding:1px 6px;font-size:10px;font-weight:500;text-transform:uppercase;letter-spacing:0.04em;color:#b8860b;background:rgba(184,134,11,0.1);border:1px solid rgba(184,134,11,0.25);border-radius:3px;vertical-align:middle; }
 .custom-size { display:flex;align-items:center;gap:8px;margin-top:8px;flex-wrap:wrap; }
-.custom-size input[type="number"] {
-  width: 110px;
-  font-family: var(--font-mono);
-  font-size: 14px;
-  color: var(--text);
-  background: var(--bg-input);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 8px 10px;
-  outline: none;
-  transition: border-color var(--transition), box-shadow var(--transition);
-}
-.custom-size input[type="number"]:focus {
-  border-color: var(--border-focus);
-  box-shadow: 0 0 0 3px var(--accent-glow);
-}
+.custom-size input[type="number"] { width: 110px; }
 .size-errors { width:100%;display:flex;flex-direction:column;gap:2px;margin-top:4px; }
 .size-errors span { font-size:11px;color:var(--danger);font-family:var(--font-mono); }
 
@@ -749,7 +827,6 @@ body {
   overflow-x: auto;
   flex: 1;
   min-width: 0;
-  scrollbar-width: thin;
 }
 
 .tab {
@@ -836,20 +913,7 @@ body {
 .batch-conc input[type="number"] {
   width: 48px;
   padding: 7px 8px;
-  font-family: var(--font-mono);
   font-size: 13px;
-  color: var(--text);
-  background: var(--bg-input);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  outline: none;
-  text-align: center;
-  transition: border-color var(--transition), box-shadow var(--transition);
-}
-
-.batch-conc input[type="number"]:focus {
-  border-color: var(--border-focus);
-  box-shadow: 0 0 0 3px var(--accent-glow);
 }
 
 /* ── Toast Notifications ── */
@@ -910,18 +974,6 @@ body {
   color: var(--accent);
 }
 
-.override-badge {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 6px 10px;
-  margin: 10px 0 6px;
-  background: var(--bg-deep);
-  border-radius: var(--radius-sm);
-  font-size: 12px;
-  color: var(--text-secondary);
-}
-
 .btn-text {
   background: none;
   border: none;
@@ -933,6 +985,20 @@ body {
   margin-top: 6px;
 }
 .btn-text:hover { text-decoration: underline; }
+
+.params-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+
+.params-sep {
+  color: var(--border);
+  font-size: 10px;
+  user-select: none;
+}
 
 /* ── Overview Section ── */
 
@@ -971,7 +1037,6 @@ body {
 
 .mask-toolbar input[type="range"] {
   width: 100px;
-  accent-color: var(--accent);
 }
 
 .mask-canvas-wrap {
